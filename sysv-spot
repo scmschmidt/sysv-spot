@@ -1,0 +1,200 @@
+#!/usr/bin/env python3.6
+# -*- coding: utf-8 -*-
+
+"""
+This tool checks the current system if SysV is still actively used. If something is found, 
+it will print the hits as well as the source and remediation help if available.
+
+This shall help to clean up the system for a time when a distribution release will be used,
+which has none SysV support anymore.
+
+Changelog:    
+            19.02.2024  v0.1    first release
+
+"""
+
+import os
+import re
+import subprocess
+import sys
+import textwrap
+from typing import List, Dict, Tuple
+
+
+__version__ = '0.0'
+__author__ = 'Sören Schmidt'
+__email__ = 'soren.schmidt@suse.com'
+__maintainer__ = __author__
+__license__ = "GPLv3"
+__status__ ='Prototype'
+
+
+class Script():
+    """Represents init script. Attributes are:
+    
+        self.name (str):            name of the script
+        self.path (str):            path to the script
+        self.package (str|None):    name of the package the script belongs to or None
+        self.empty (bool):          True if the script contains no lines else False
+                                    (Comments and empty lines excluded!)
+    """
+    
+    def __init__(self, path: str) -> None:
+        
+        self.name = os.path.split(path)[1]
+        self.path = path
+        
+        p = subprocess.run(['rpm', '-qf', path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.package = p.stdout.decode('utf-8').strip() if p.returncode == 0 else None
+        
+        empty_line =re.compile('^\s*(#.*|\s*)$')    # comments or empty lines
+        with open(path, 'r') as f:
+            nonempty_lines = len(''.join([line for line in f.readlines() if not empty_line.search(line)]))
+        self.empty = True if nonempty_lines == 0 else False
+
+
+class Package():
+    """Represents a RPM package. Attributes are:
+    
+        self.fullname (str):    name used when instantiate the object
+        self.name (str):        package name (from RPM database)
+        self.vendor (str):      vendor (from RPM database)
+    """
+    
+    def __init__(self, packagename: str) -> None:
+
+        self.fullname = packagename
+        
+        p = subprocess.run(['rpm', '-q', '--qf', 'name:%{name}\nvendor:%{vendor}', self.fullname], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for k,v in [pair.split(':', maxsplit=1) for pair in p.stdout.decode('utf-8').split('\n')]:
+            setattr(self, k, v)
+ 
+
+def printf(*args: Tuple[str, str]):
+    """Prints tuples in one line. First element is the text, second a format code string."""
+    
+    format_codes = {'bold': '\033[1m', 
+        'underline': '\033[4m',
+        'purple': '\033[95m',
+        'cyan': '\033[96m',
+        'darkcyan': '\033[36m',
+        'blue': '\033[94m',
+        'green': '\033[92m',
+        'yellow': '\033[93m',
+        'red': '\033[91m',
+        'black': '\033[0;30m',
+        'gray': '\033[1;30m',
+        'lightgray': '\033[0;37m',
+        'white': '\033[1;37m'
+        }
+    
+    text = []
+    for element in args:
+        if element[1]:
+            codes = element[1].split('|')
+            text.extend([format_codes[code] for code in codes])
+        text.append(element[0])
+        if element[1]:
+            text.append('\033[0m')
+    print(''.join(text))
+
+
+def format_multiline(text: str, indent: int=0) -> None:
+    """Returns the multiline text with each line indented except the first."""
+      
+    return textwrap.indent(textwrap.dedent(text), ' ' * indent).strip()
+
+
+def find_local_init_scripts(initdir: str='/etc/init.d') -> List[Script]:
+    """Returns a list of Script instances representing each init script found in given directory."""
+    
+    return [Script(f'{initdir}/{file}') for file in os.listdir(initdir) if os.path.isfile(f'{initdir}/{file}') and not file.endswith('.swp')] if os.path.isdir(initdir) else []
+
+
+def retrieve_package_information(init_scripts: List[Script]) -> Dict[str, Package]:
+    """Returns a dictionary with the package name as key and a Package instance as value for all 
+    packages listed in the given list of Script instances."""
+
+    return {script.package: Package(script.package) for script in init_scripts if script.package}
+     
+
+def get_origin(script: Script, packages: Dict[str, Package]) -> str:
+    """Returns the origin of the given Script instance if listed in local dictionary or "unknown"."""
+    
+    catalog = {
+        'sapinit': 'SAP StartService'
+        }
+    
+    if script.name in catalog:
+        return catalog[script.name]
+    
+    if script.package:
+        return packages[script.package].vendor
+
+    return '(unknown)'
+    
+
+def get_remediation(script: Script, packages: Dict[str, Package]) -> Tuple[str, bool]:
+    """Returns a tuple with the remediation of the given Script instance if listed in local dictionary
+    and a boolean which indicates, if the customer needs to take action (True) or not (False).
+    """
+    
+    catalog = {
+        'sapinit': ('''\
+            Migrate your SAP instances and the SAP HostAgent to systemd!
+            See SAP-Notes:
+            - 3139184 - Linux: systemd integration for sapstartsrv and SAP Host Agent
+            - 3115048 - sapstartsrv with native Linux systemd support
+            - 3091152 - sapstartsrv - improved deregistration for UNIX/Linux
+            - 3145200 - SAP Host Agent 7.22 PL57
+        ''', True),
+        }
+    
+    if script.name in catalog:
+        return catalog[script.name]
+    
+    if script.name in ['boot.local', 'halt.local', 'after.local']:
+        if script.empty:
+            return 'This file will not be available anymore, but is currently empty! Nothing needs to be done.', False
+        else:
+            return 'This file will not be available anymore and has content! Migrate the content to a systemd unit!', True
+    
+    if script.package and packages[script.package].vendor.startswith('SUSE LLC'):
+        return 'This is an OS package and will be migrated to systemd by SUSE.\nNothing needs to be done.', False
+
+    return 'Contact the author/vendor to provide a systemd compatible version!\nPlease report your findings to the project.', True
+
+
+def main() -> None:
+    
+    # Search for init files and retrieve information for all packages where init scripts have been found.
+    try:
+        init_scripts = find_local_init_scripts()
+        packages = retrieve_package_information(init_scripts)
+    except Exception as err:
+        printf((f'An error occurred: {err}', 'red'))
+        sys.exit(1)
+       
+    # If we have some, walk through them, get their package, details and remediation.
+    if init_scripts:
+        
+        for script in init_scripts:
+            remediation, action_needed = get_remediation(script, packages)
+            print()
+            printf(('SysV init file: ', 'bold|gray'), (script.path, 'bold')) 
+            printf(('RPM package   : ', 'bold|gray'), (script.package or '', None))
+            printf(('Origin        : ', 'bold|gray'), (get_origin(script, packages), None))
+            printf(('Remediation   : ', 'bold|gray'), (format_multiline(remediation, indent=16), 'red' if action_needed else 'green'))
+            print()
+
+    else:
+        printf(('No init scripts found. Nothing needs to be done.', 'green'))
+        
+    # Bye.
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
+    
+    

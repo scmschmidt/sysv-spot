@@ -190,6 +190,16 @@ def main() -> None:
     else:
         printf(('No init scripts found. Nothing needs to be done.', 'green'))
         
+    # Some general recommendations.
+    comment = '''\
+        The commands:
+            - runlevel
+            - telinit
+        will not work anymore. Also all runlevel targets (runlevel{0..6}.target) get removed.
+        Please check your scripts, if they are still in use!.
+        '''
+    printf((textwrap.dedent(comment), 'cyan'))
+        
     # Bye.
     sys.exit(0)
 
